@@ -42,7 +42,12 @@ DELTA_BASE_PATH = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
-# Anthropic (Genie QA agent)
+# Databricks Genie AI/BI space
+# ---------------------------------------------------------------------------
+GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID", "")   # from notebook 05
+
+# ---------------------------------------------------------------------------
+# Anthropic (kept for optional local fallback use)
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL      = "claude-sonnet-4-6"
