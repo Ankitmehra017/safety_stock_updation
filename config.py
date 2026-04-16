@@ -12,7 +12,29 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # ---------------------------------------------------------------------------
-# Delta Lake paths (local mode)
+# Unity Catalog (Databricks — primary mode)
+# ---------------------------------------------------------------------------
+CATALOG = os.getenv("DATABRICKS_CATALOG", "dev")
+SCHEMA  = os.getenv("DATABRICKS_SCHEMA",  "safety_stock_gold")
+
+# ---------------------------------------------------------------------------
+# Databricks connectivity (SQL warehouse)
+# ---------------------------------------------------------------------------
+DATABRICKS_HOST      = os.getenv("DATABRICKS_HOST", "")          # e.g. https://adb-xxx.azuredatabricks.net
+DATABRICKS_TOKEN     = os.getenv("DATABRICKS_TOKEN", "")          # personal access token
+DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")      # SQL warehouse HTTP path
+
+# ---------------------------------------------------------------------------
+# MLflow (set to Databricks managed URI when running on a cluster)
+# ---------------------------------------------------------------------------
+MLFLOW_TRACKING_URI = os.getenv(
+    "MLFLOW_TRACKING_URI",
+    str(Path(__file__).parent / "data" / "mlruns"),   # local fallback
+)
+MODEL_NAME = "safety-stock-model"
+
+# ---------------------------------------------------------------------------
+# Local Delta Lake fallback (used when DATABRICKS_HOST is not set)
 # ---------------------------------------------------------------------------
 DELTA_BASE_PATH = os.getenv(
     "DELTA_TABLE_PATH",
@@ -20,28 +42,13 @@ DELTA_BASE_PATH = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
-# MLflow
-# ---------------------------------------------------------------------------
-MLFLOW_TRACKING_URI = os.getenv(
-    "MLFLOW_TRACKING_URI",
-    str(Path(__file__).parent / "data" / "mlruns"),
-)
-MODEL_NAME = "safety-stock-model"
-
-# ---------------------------------------------------------------------------
 # Anthropic (Genie QA agent)
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-6"
-
-# ---------------------------------------------------------------------------
-# Databricks (optional — used when DATABRICKS_HOST is set)
-# ---------------------------------------------------------------------------
-DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "")
-DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
+CLAUDE_MODEL      = "claude-sonnet-4-6"
 
 # ---------------------------------------------------------------------------
 # App settings
 # ---------------------------------------------------------------------------
 APP_TITLE = "Generac Safety Stock Update"
-APP_ICON = "🏭"
+APP_ICON  = "🏭"
