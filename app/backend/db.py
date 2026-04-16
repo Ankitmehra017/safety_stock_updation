@@ -162,7 +162,15 @@ def get_approval_requests(
     manager_id: str | None = None,
     status: str | None = None,
 ) -> pd.DataFrame:
-    df = _read("approval_requests")
+    """
+    Read approval requests from local Delta storage.
+
+    Approval state is always stored locally (by approval.py) so that the
+    Streamlit app has a consistent read/write path regardless of whether
+    Databricks connectivity is configured.
+    """
+    from app.backend.approval import _read_requests  # local import avoids circular dep
+    df = _read_requests()
     if df.empty:
         return df
     if manager_id:

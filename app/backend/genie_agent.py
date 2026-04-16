@@ -1,21 +1,28 @@
 """
 app/backend/genie_agent.py
 ===========================
-Databricks Genie AI/BI REST API client.
+Databricks Genie AI/BI client using the official Databricks SDK.
 
-Flow per question:
-  1. POST  /spaces/{space_id}/start-conversation      → conversation_id, message_id
-  2. GET   /spaces/{space_id}/conversations/{c}/messages/{m}   (poll status)
-  3. GET   /spaces/{space_id}/conversations/{c}/messages/{m}/query-result
-  4. Execute the SQL via Databricks SQL connector to return a pandas DataFrame
+Usage pattern (matching confirmed working SDK API):
 
-Follow-up questions within the same session reuse the conversation_id so
-Genie has full context of the prior exchange.
+    w.genie.start_conversation_and_wait(space_id, content)
+        → GenieMessage  (new conversation)
+
+    w.genie.create_message_and_wait(space_id, conversation_id, content)
+        → GenieMessage  (follow-up in same conversation)
+
+Each GenieMessage has:
+    .conversation_id  str
+    .message_id       str
+    .attachments      list[GenieAttachment]
+        attachment.text    → GenieAttachmentText  (.content)
+        attachment.query   → GenieAttachmentQuery (.query, .description)
+
+SQL from .query.query is executed via databricks-sql-connector so the
+Streamlit app gets back a pandas DataFrame alongside the narrative text.
 """
 
 import sys
-import time
-import requests
 import pandas as pd
 from pathlib import Path
 from typing import Optional
@@ -23,92 +30,31 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import (
     DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_HTTP_PATH,
-    GENIE_SPACE_ID, CATALOG, SCHEMA,
+    GENIE_SPACE_ID,
 )
 
-_BASE_URL = f"{DATABRICKS_HOST.rstrip('/')}/api/2.0/genie"
-_POLL_INTERVAL = 2   # seconds between status checks
-_POLL_TIMEOUT  = 90  # seconds before giving up
-
 
 # ---------------------------------------------------------------------------
-# Internal HTTP helpers
+# SDK client factory
 # ---------------------------------------------------------------------------
 
-def _headers() -> dict:
-    return {
-        "Authorization": f"Bearer {DATABRICKS_TOKEN}",
-        "Content-Type":  "application/json",
-    }
-
-
-def _post(path: str, body: dict) -> dict:
-    url  = f"{_BASE_URL}/{path}"
-    resp = requests.post(url, headers=_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _get(path: str) -> dict:
-    url  = f"{_BASE_URL}/{path}"
-    resp = requests.get(url, headers=_headers(), timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-# ---------------------------------------------------------------------------
-# Genie conversation helpers
-# ---------------------------------------------------------------------------
-
-def _start_conversation(question: str) -> tuple[str, str]:
-    """Start a new Genie conversation. Returns (conversation_id, message_id)."""
-    data = _post(
-        f"spaces/{GENIE_SPACE_ID}/start-conversation",
-        {"content": question},
-    )
-    return data["conversation_id"], data["message_id"]
-
-
-def _create_message(conversation_id: str, question: str) -> str:
-    """Send a follow-up message. Returns message_id."""
-    data = _post(
-        f"spaces/{GENIE_SPACE_ID}/conversations/{conversation_id}/messages",
-        {"content": question},
-    )
-    return data["message_id"]
-
-
-def _poll_message(conversation_id: str, message_id: str) -> dict:
-    """Poll until the message reaches a terminal status."""
-    path      = f"spaces/{GENIE_SPACE_ID}/conversations/{conversation_id}/messages/{message_id}"
-    deadline  = time.time() + _POLL_TIMEOUT
-    terminal  = {"COMPLETED", "FAILED", "CANCELLED", "QUERY_RESULT_EXPIRED"}
-
-    while time.time() < deadline:
-        msg = _get(path)
-        if msg.get("status") in terminal:
-            return msg
-        time.sleep(_POLL_INTERVAL)
-
-    raise TimeoutError(f"Genie did not respond within {_POLL_TIMEOUT}s")
-
-
-def _extract_attachments(msg: dict) -> tuple[Optional[str], Optional[str]]:
+def _workspace_client():
     """
-    Pull SQL query and plain-text description from Genie message attachments.
-    Returns (sql, description).
+    Return an authenticated WorkspaceClient.
+
+    Inside a Databricks notebook WorkspaceClient() picks up credentials
+    automatically.  Outside (e.g. running Streamlit locally) it uses the
+    host + token from .env.
     """
-    sql         = None
-    description = None
+    from databricks.sdk import WorkspaceClient
 
-    for att in msg.get("attachments", []):
-        if att.get("query"):
-            sql         = att["query"].get("query")
-            description = att["query"].get("description") or description
-        if att.get("text"):
-            description = att["text"].get("content") or description
-
-    return sql, description
+    if DATABRICKS_HOST and DATABRICKS_TOKEN:
+        return WorkspaceClient(
+            host=DATABRICKS_HOST,
+            token=DATABRICKS_TOKEN,
+        )
+    # Auto-auth (Databricks notebook / cluster environment)
+    return WorkspaceClient()
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +62,7 @@ def _extract_attachments(msg: dict) -> tuple[Optional[str], Optional[str]]:
 # ---------------------------------------------------------------------------
 
 def _run_sql(sql: str) -> pd.DataFrame:
-    """Execute SQL on a Databricks SQL warehouse and return a pandas DataFrame."""
+    """Execute SQL on the configured SQL warehouse, return a pandas DataFrame."""
     from databricks import sql as dbsql
 
     with dbsql.connect(
@@ -130,6 +76,33 @@ def _run_sql(sql: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Attachment parsing
+# ---------------------------------------------------------------------------
+
+def _parse_attachments(message) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract (sql, description) from a GenieMessage's attachments.
+
+    Priority:
+      - sql         → first attachment that has a .query field
+      - description → .query.description if present, else first .text.content
+    """
+    sql         = None
+    description = None
+
+    for att in (message.attachments or []):
+        if att.query:
+            if sql is None:
+                sql = att.query.query
+            if description is None and att.query.description:
+                description = att.query.description
+        if att.text and description is None:
+            description = att.text.content
+
+    return sql, description
+
+
+# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
@@ -138,90 +111,83 @@ def ask_genie(
     conversation_id: Optional[str] = None,
 ) -> dict:
     """
-    Send a natural-language question to the Databricks Genie space.
+    Send a natural-language question to the configured Databricks Genie space.
 
     Args:
-        question        : The buyer's question in plain English.
-        conversation_id : Pass the id from a previous call to continue the
-                          same conversation (Genie retains context).
+        question        : Plain-English question from the buyer.
+        conversation_id : ID from a previous call to continue the same
+                          conversation (Genie retains full context).
+                          Pass None to start a fresh conversation.
 
-    Returns a dict with:
-        sql             : SQL generated by Genie (str | None)
-        results         : Query results as a pandas DataFrame (None on error)
-        description     : Genie's plain-English narrative answer (str | None)
-        conversation_id : Use this in the next call for follow-up questions
+    Returns a dict:
+        sql             : SQL string generated by Genie  (str | None)
+        results         : Query results as pandas DataFrame  (None on error)
+        description     : Genie's plain-English narrative  (str | None)
+        conversation_id : Pass back on the next call for follow-up questions
         message_id      : ID of this specific message
         error           : Error string if the call failed, else None
     """
+    # ── Guard: required config ─────────────────────────────────────────────
     if not GENIE_SPACE_ID:
-        return {
-            "sql": None, "results": None, "description": None,
-            "conversation_id": None, "message_id": None,
-            "error": (
-                "GENIE_SPACE_ID is not configured. "
-                "Run notebook 05_setup_genie_space and add the ID to your .env file."
-            ),
-        }
-
-    if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
-        return {
-            "sql": None, "results": None, "description": None,
-            "conversation_id": None, "message_id": None,
-            "error": "DATABRICKS_HOST and DATABRICKS_TOKEN must be set in .env",
-        }
+        return _error(
+            conversation_id,
+            "GENIE_SPACE_ID is not set. "
+            "Run notebook 05_setup_genie_space in Databricks, create the Genie "
+            "space, then add GENIE_SPACE_ID=<id> to your .env file.",
+        )
 
     try:
-        # ── 1. Start or continue conversation ─────────────────────────────────
+        w = _workspace_client()
+
+        # ── Call Genie (SDK handles polling automatically) ─────────────────
         if conversation_id:
-            message_id = _create_message(conversation_id, question)
+            # Follow-up question in the same conversation
+            message = w.genie.create_message_and_wait(
+                space_id=GENIE_SPACE_ID,
+                conversation_id=conversation_id,
+                content=question,
+            )
         else:
-            conversation_id, message_id = _start_conversation(question)
+            # New conversation
+            message = w.genie.start_conversation_and_wait(
+                space_id=GENIE_SPACE_ID,
+                content=question,
+            )
 
-        # ── 2. Poll for completion ─────────────────────────────────────────────
-        msg = _poll_message(conversation_id, message_id)
+        # ── Extract SQL + description from attachments ─────────────────────
+        sql, description = _parse_attachments(message)
 
-        if msg.get("status") != "COMPLETED":
-            return {
-                "sql": None, "results": None, "description": None,
-                "conversation_id": conversation_id, "message_id": message_id,
-                "error": f"Genie returned status: {msg.get('status')}",
-            }
-
-        # ── 3. Extract SQL and description from attachments ────────────────────
-        sql, description = _extract_attachments(msg)
-
-        # ── 4. Execute SQL to get results ──────────────────────────────────────
+        # ── Execute the SQL to get a DataFrame ────────────────────────────
         results = None
         if sql and DATABRICKS_HTTP_PATH:
             try:
                 results = _run_sql(sql)
             except Exception as sql_err:
-                description = (description or "") + f"\n\n⚠️ Could not execute SQL: {sql_err}"
+                description = (description or "") + f"\n\n⚠️ SQL execution error: {sql_err}"
 
         return {
             "sql":             sql,
             "results":         results,
             "description":     description,
-            "conversation_id": conversation_id,
-            "message_id":      message_id,
+            "conversation_id": message.conversation_id,
+            "message_id":      message.message_id,
             "error":           None,
         }
 
-    except TimeoutError as e:
-        return {
-            "sql": None, "results": None, "description": None,
-            "conversation_id": conversation_id, "message_id": None,
-            "error": str(e),
-        }
-    except requests.HTTPError as e:
-        return {
-            "sql": None, "results": None, "description": None,
-            "conversation_id": conversation_id, "message_id": None,
-            "error": f"Genie API error {e.response.status_code}: {e.response.text[:300]}",
-        }
     except Exception as e:
-        return {
-            "sql": None, "results": None, "description": None,
-            "conversation_id": None, "message_id": None,
-            "error": str(e),
-        }
+        return _error(conversation_id, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+def _error(conversation_id: Optional[str], msg: str) -> dict:
+    return {
+        "sql":             None,
+        "results":         None,
+        "description":     None,
+        "conversation_id": conversation_id,
+        "message_id":      None,
+        "error":           msg,
+    }

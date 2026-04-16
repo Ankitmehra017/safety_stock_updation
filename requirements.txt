@@ -19,8 +19,9 @@ plotly>=5.20.0
 # SQL execution for Genie QA (reads Delta Parquet files locally)
 duckdb>=0.10.0
 
-# Databricks connectivity (SQL warehouse — used by Streamlit app)
-databricks-sql-connector>=3.0.0
+# Databricks connectivity
+databricks-sdk>=0.20.0             # WorkspaceClient + Genie API
+databricks-sql-connector>=3.0.0    # SQL warehouse query execution
 
 # Local Delta Lake fallback (when DATABRICKS_HOST is not set)
 deltalake>=0.17.0

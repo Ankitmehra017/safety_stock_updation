@@ -2,7 +2,12 @@
 app/backend/approval.py
 ========================
 Approval workflow CRUD operations.
-Reads/writes the serving/approval_requests Delta table.
+Reads/writes the serving/approval_requests Delta table on local disk.
+
+Note: Approval state is managed as app-side local Delta files so it works
+consistently whether the Streamlit app runs locally or on a Databricks cluster.
+The Unity Catalog `approval_requests` table (created in notebook 04) holds the
+initial empty schema; runtime state is written here via deltalake.
 """
 
 import os
@@ -10,7 +15,6 @@ import sys
 import uuid
 import pandas as pd
 from pathlib import Path
-from deltalake import DeltaTable, write_deltalake
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config import DELTA_BASE_PATH
@@ -20,6 +24,7 @@ APPROVAL_TABLE_PATH = os.path.join(DELTA_BASE_PATH, "serving", "approval_request
 
 def _read_requests() -> pd.DataFrame:
     try:
+        from deltalake import DeltaTable
         dt = DeltaTable(APPROVAL_TABLE_PATH)
         df = dt.to_pandas()
         if "submitted_at" in df.columns:
@@ -32,6 +37,8 @@ def _read_requests() -> pd.DataFrame:
 
 
 def _write_requests(df: pd.DataFrame) -> None:
+    from deltalake import write_deltalake
+    os.makedirs(APPROVAL_TABLE_PATH, exist_ok=True)
     write_deltalake(APPROVAL_TABLE_PATH, df, mode="overwrite")
 
 
@@ -48,7 +55,7 @@ def submit_for_approval(
 ) -> str:
     """
     Create a new approval request.
-    Returns the generated request_id.
+    Returns the generated request_id (or the existing one if already pending).
     """
     existing = _read_requests()
 
@@ -64,20 +71,20 @@ def submit_for_approval(
 
     request_id = str(uuid.uuid4())
     new_row = pd.DataFrame([{
-        "request_id": request_id,
-        "material_id": material_id,
-        "plant": plant,
-        "buyer_id": buyer_id,
-        "current_ss": int(current_ss),
-        "new_ss": int(new_ss),
-        "pct_change": float(pct_change),
-        "driver_1": driver_1,
-        "driver_2": driver_2,
-        "driver_3": driver_3,
-        "status": "pending",
-        "submitted_at": pd.Timestamp.now(),
-        "manager_id": None,
-        "reviewed_at": pd.NaT,
+        "request_id":      request_id,
+        "material_id":     material_id,
+        "plant":           plant,
+        "buyer_id":        buyer_id,
+        "current_ss":      int(current_ss),
+        "new_ss":          int(new_ss),
+        "pct_change":      float(pct_change),
+        "driver_1":        driver_1,
+        "driver_2":        driver_2,
+        "driver_3":        driver_3,
+        "status":          "pending",
+        "submitted_at":    pd.Timestamp.now(),
+        "manager_id":      None,
+        "reviewed_at":     pd.NaT,
         "manager_comment": None,
     }])
 
@@ -88,11 +95,7 @@ def submit_for_approval(
 
 def submit_bulk(rows: list[dict]) -> list[str]:
     """Submit multiple approval requests at once."""
-    request_ids = []
-    for row in rows:
-        rid = submit_for_approval(**row)
-        request_ids.append(rid)
-    return request_ids
+    return [submit_for_approval(**row) for row in rows]
 
 
 def approve_request(request_id: str, manager_id: str, comment: str = "") -> bool:
@@ -103,9 +106,9 @@ def approve_request(request_id: str, manager_id: str, comment: str = "") -> bool
     mask = df["request_id"] == request_id
     if not mask.any():
         return False
-    df.loc[mask, "status"] = "approved"
-    df.loc[mask, "manager_id"] = manager_id
-    df.loc[mask, "reviewed_at"] = pd.Timestamp.now()
+    df.loc[mask, "status"]          = "approved"
+    df.loc[mask, "manager_id"]      = manager_id
+    df.loc[mask, "reviewed_at"]     = pd.Timestamp.now()
     df.loc[mask, "manager_comment"] = comment
     _write_requests(df)
     return True
@@ -119,9 +122,9 @@ def reject_request(request_id: str, manager_id: str, comment: str = "") -> bool:
     mask = df["request_id"] == request_id
     if not mask.any():
         return False
-    df.loc[mask, "status"] = "rejected"
-    df.loc[mask, "manager_id"] = manager_id
-    df.loc[mask, "reviewed_at"] = pd.Timestamp.now()
+    df.loc[mask, "status"]          = "rejected"
+    df.loc[mask, "manager_id"]      = manager_id
+    df.loc[mask, "reviewed_at"]     = pd.Timestamp.now()
     df.loc[mask, "manager_comment"] = comment
     _write_requests(df)
     return True
